@@ -1,12 +1,12 @@
 [project]
 name = "docker-tartare"
-version = "0.1.0"
+version = "0.2.0"
 description = "Docker TAR manipulation tool"
 readme = "README.md"
 authors = [
-    { name = "Sygmei", email = "3835355+Sygmei@users.noreply.github.com" }
+    { name = "Sygmei", email = "3835355+Sygmei@users.noreply.github.com" },
 ]
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 dependencies = []
 
 [project.scripts]
