@@ -378,7 +378,11 @@ cmd_extract_dir() {
       fi
 
       if [[ -n "$prefix" ]]; then
-        rel="${name#"$prefix"}"
+        if [[ "$name" == "$image_dir" ]]; then
+          rel=""
+        else
+          rel="${name#"$prefix"}"
+        fi
       else
         rel="$name"
       fi
