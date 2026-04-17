@@ -16,12 +16,15 @@ usage() {
 Usage:
   docker-tartare.bash list <save_tar> [path] [--dirs]
   docker-tartare.bash extract <save_tar> <image_path> <output> [--dir]
+
+Notes:
+  extract prints the exported output tree to stderr.
 EOF
 }
 
 require_deps() {
   local dep
-  for dep in tar jq mktemp sort; do
+  for dep in tar jq mktemp sort find; do
     command -v "$dep" >/dev/null 2>&1 || die "Missing required command: $dep"
   done
 }
@@ -107,6 +110,55 @@ is_under_opaque() {
     rest="${rest#*/}"
   done
   return 1
+}
+
+tree_prefix() {
+  local depth="$1"
+  local prefix=""
+  local i
+
+  for ((i = 1; i < depth; i++)); do
+    prefix="${prefix}|   "
+  done
+
+  printf '%s' "$prefix"
+}
+
+log_export_tree() {
+  local target="$1"
+  local entry rel slash_marks depth prefix found root_name
+
+  if [[ ! -e "$target" && ! -L "$target" ]]; then
+    printf 'exported tree: %s (missing after extraction)\n' "$target" >&2
+    return
+  fi
+
+  root_name="$(basename "$target")"
+  printf 'exported tree: %s\n' "$target" >&2
+
+  if [[ -d "$target" && ! -L "$target" ]]; then
+    printf '%s/\n' "$root_name" >&2
+    found=0
+    while IFS= read -r entry; do
+      found=1
+      rel="${entry#$target/}"
+      slash_marks="${rel//[^\/]/}"
+      depth=$(( ${#slash_marks} + 1 ))
+      prefix="$(tree_prefix "$depth")"
+      if [[ -d "$entry" && ! -L "$entry" ]]; then
+        printf '%s|-- %s/\n' "$prefix" "$(basename "$entry")" >&2
+      else
+        printf '%s|-- %s\n' "$prefix" "$(basename "$entry")" >&2
+      fi
+    done < <(find "$target" -mindepth 1 -print | LC_ALL=C sort)
+
+    if ((found == 0)); then
+      printf '`-- [empty]\n' >&2
+    fi
+    return
+  fi
+
+  printf '`-- %s\n' "$root_name" >&2
 }
 
 extract_member_to_path() {
@@ -290,6 +342,7 @@ cmd_extract_file() {
         die "Failed to extract $image_path from layer $layer_path"
       }
       rm -f "$tmp_layer"
+      log_export_tree "$out_path"
       return 0
     fi
 
@@ -403,6 +456,7 @@ cmd_extract_dir() {
   done
 
   rm -rf "$tmp_state"
+  log_export_tree "$out_dir"
 }
 
 main() {
