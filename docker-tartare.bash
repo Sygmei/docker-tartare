@@ -6,6 +6,8 @@ if ((BASH_VERSINFO[0] < 3)); then
   exit 1
 fi
 
+ROOT_OPAQUE_MARKER="__docker_tartare_root_opaque__"
+
 die() {
   echo "error: $*" >&2
   exit 1
@@ -33,18 +35,6 @@ norm_image_path() {
   local p="$1"
   p="${p#/}"
   printf '%s' "$p"
-}
-
-whiteout_name() {
-  local target="$1"
-  local d b
-  d="$(dirname "$target")"
-  b="$(basename "$target")"
-  if [[ "$d" == "." ]]; then
-    printf '.wh.%s' "$b"
-  else
-    printf '%s/.wh.%s' "$d" "$b"
-  fi
 }
 
 opaque_whiteout_name() {
@@ -91,11 +81,37 @@ set_has() {
   grep -Fxq -- "$key" "$set_file"
 }
 
+merge_set_file() {
+  local dest_file="$1"
+  local src_file="$2"
+  [[ -s "$src_file" ]] || return 0
+  cat "$src_file" >>"$dest_file"
+}
+
+deleted_path_matches() {
+  local path="$1"
+  local deleted_file="$2"
+  local candidate="$path"
+
+  while [[ -n "$candidate" ]]; do
+    if set_has "$deleted_file" "$candidate"; then
+      return 0
+    fi
+    [[ "$candidate" == */* ]] || break
+    candidate="${candidate%/*}"
+  done
+  return 1
+}
+
 is_under_opaque() {
   local path="$1"
   local opaque_file="$2"
   local rest="$path"
   local part acc=""
+
+  if set_has "$opaque_file" "$ROOT_OPAQUE_MARKER"; then
+    return 0
+  fi
 
   while [[ "$rest" == */* ]]; do
     part="${rest%%/*}"
@@ -122,6 +138,53 @@ tree_prefix() {
   done
 
   printf '%s' "$prefix"
+}
+
+record_seen_entry() {
+  local seen_all_file="$1"
+  local seen_meta_file="$2"
+  local name="$3"
+  local kind="$4"
+
+  [[ -n "$name" ]] || return 0
+  if ! set_has "$seen_all_file" "$name"; then
+    set_add "$seen_all_file" "$name"
+    printf '%s\t%s\n' "$name" "$kind" >>"$seen_meta_file"
+  fi
+}
+
+record_parent_dirs() {
+  local seen_all_file="$1"
+  local seen_meta_file="$2"
+  local name="$3"
+  local scope_root="${4:-}"
+  local parent="$name"
+
+  while [[ "$parent" == */* ]]; do
+    parent="${parent%/*}"
+    if [[ -n "$scope_root" && "$parent" != "$scope_root" && "$parent" != "$scope_root/"* ]]; then
+      continue
+    fi
+    record_seen_entry "$seen_all_file" "$seen_meta_file" "$parent" "dir"
+  done
+}
+
+mark_seen_path_and_parents() {
+  local seen_file="$1"
+  local name="$2"
+  local scope_root="${3:-}"
+  local parent="$name"
+
+  while [[ -n "$parent" ]]; do
+    if [[ -n "$scope_root" && "$parent" != "$scope_root" && "$parent" != "$scope_root/"* ]]; then
+      break
+    fi
+    if ! set_has "$seen_file" "$parent"; then
+      set_add "$seen_file" "$parent"
+    fi
+    [[ "$parent" == */* ]] || break
+    parent="${parent%/*}"
+  done
 }
 
 log_export_tree() {
@@ -161,28 +224,28 @@ log_export_tree() {
   printf '`-- %s\n' "$root_name" >&2
 }
 
-extract_member_to_path() {
+extract_layer_to_dir() {
   local layer_tar="$1"
+  local out_dir="$2"
+
+  tar -xmf "$layer_tar" -C "$out_dir"
+}
+
+copy_extracted_path() {
+  local extracted_root="$1"
   local member="$2"
   local out_path="$3"
-  local tmp_dir src
+  local src
 
-  tmp_dir="$(mktemp -d)"
-  if ! tar -xmf "$layer_tar" -C "$tmp_dir" -- "$member" 2>/dev/null; then
-    local alt="${member#./}"
-    if ! tar -xmf "$layer_tar" -C "$tmp_dir" -- "$alt" 2>/dev/null; then
-      rm -rf "$tmp_dir"
-      return 1
-    fi
-    member="$alt"
-  fi
-
-  src="$tmp_dir/${member#./}"
+  src="$extracted_root/${member#./}"
   src="${src%/}"
+
+  if [[ ! -e "$src" && ! -L "$src" ]]; then
+    return 1
+  fi
 
   if [[ -d "$src" && ! -L "$src" ]]; then
     mkdir -p "$out_path"
-    rm -rf "$tmp_dir"
     return 0
   fi
 
@@ -191,7 +254,54 @@ extract_member_to_path() {
     rm -rf "$out_path"
   fi
   cp -a "$src" "$out_path"
-  rm -rf "$tmp_dir"
+}
+
+collect_layer_whiteouts() {
+  local layer_list="$1"
+  local prefix="${2:-}"
+  local image_path="${3:-}"
+  local deleted_file="$4"
+  local opaque_file="$5"
+  local raw name base real parent deleted_target key target_dir
+
+  while IFS= read -r raw; do
+    [[ -n "$raw" ]] || continue
+    name="$(sanitize_member_name "$raw")"
+    [[ -z "$name" || "$name" == "." ]] && continue
+
+    if [[ -n "$prefix" && "$name" != "$image_path" && "$name" != "$prefix"* ]]; then
+      continue
+    fi
+
+    base="${name##*/}"
+    if [[ "$base" != .wh.* ]]; then
+      continue
+    fi
+
+    real="${base#.wh.}"
+    if [[ "$name" == */* ]]; then
+      parent="${name%/*}"
+    else
+      parent=""
+    fi
+
+    if [[ "$real" == ".wh..opq" || "$base" == ".wh..wh..opq" ]]; then
+      target_dir="$parent"
+      key="$target_dir"
+      if [[ -z "$key" ]]; then
+        key="$ROOT_OPAQUE_MARKER"
+      fi
+      set_add "$opaque_file" "$key"
+      continue
+    fi
+
+    if [[ -n "$parent" ]]; then
+      deleted_target="$parent/$real"
+    else
+      deleted_target="$real"
+    fi
+    set_add "$deleted_file" "$deleted_target"
+  done <"$layer_list"
 }
 
 cmd_list() {
@@ -199,9 +309,10 @@ cmd_list() {
   local image_path="${2:-}"
   local dirs_only="${3:-0}"
   local prefix=""
-  local layer_path raw name base real parent deleted_target key
-  local i is_dir kind
+  local layer_path raw name base kind
+  local i is_dir
   local tmp_state deleted_file opaque_file seen_all_file seen_meta_file tab
+  local layer_list layer_deleted_file layer_opaque_file
 
   if [[ -n "$image_path" ]]; then
     image_path="$(norm_image_path "$image_path")"
@@ -222,8 +333,16 @@ cmd_list() {
 
   for ((i = ${#LAYERS[@]} - 1; i >= 0; i--)); do
     layer_path="${LAYERS[i]}"
+    layer_list="$(mktemp)"
+    layer_deleted_file="$tmp_state/layer_deleted_$i"
+    layer_opaque_file="$tmp_state/layer_opaque_$i"
+    touch "$layer_deleted_file" "$layer_opaque_file"
+
+    tar -xOf "$save_tar" "$layer_path" | tar -tf - >"$layer_list"
+    collect_layer_whiteouts "$layer_list" "$prefix" "$image_path" "$layer_deleted_file" "$layer_opaque_file"
+
     while IFS= read -r raw; do
-      [[ -z "$raw" ]] && continue
+      [[ -n "$raw" ]] || continue
       is_dir=0
       [[ "$raw" == */ ]] && is_dir=1
 
@@ -236,32 +355,10 @@ cmd_list() {
 
       base="${name##*/}"
       if [[ "$base" == .wh.* ]]; then
-        real="${base#.wh.}"
-        if [[ "$name" == */* ]]; then
-          parent="${name%/*}"
-        else
-          parent=""
-        fi
-
-        if [[ "$real" == ".wh..opq" || "$base" == ".wh..wh..opq" ]]; then
-          key="$parent"
-          if [[ -z "$key" ]]; then
-            key="${name%/}"
-          fi
-          set_add "$opaque_file" "$key"
-          continue
-        fi
-
-        if [[ -n "$parent" ]]; then
-          deleted_target="$parent/$real"
-        else
-          deleted_target="$real"
-        fi
-        set_add "$deleted_file" "$deleted_target"
         continue
       fi
 
-      if set_has "$deleted_file" "$name"; then
+      if deleted_path_matches "$name" "$deleted_file"; then
         continue
       fi
 
@@ -269,16 +366,18 @@ cmd_list() {
         continue
       fi
 
-      if ! set_has "$seen_all_file" "$name"; then
-        set_add "$seen_all_file" "$name"
-        if ((is_dir)); then
-          kind="dir"
-        else
-          kind="file"
-        fi
-        printf '%s\t%s\n' "$name" "$kind" >>"$seen_meta_file"
+      if ((is_dir)); then
+        kind="dir"
+      else
+        kind="file"
       fi
-    done < <(tar -xOf "$save_tar" "$layer_path" | tar -tf -)
+      record_seen_entry "$seen_all_file" "$seen_meta_file" "$name" "$kind"
+      record_parent_dirs "$seen_all_file" "$seen_meta_file" "$name" "$image_path"
+    done <"$layer_list"
+
+    merge_set_file "$deleted_file" "$layer_deleted_file"
+    merge_set_file "$opaque_file" "$layer_opaque_file"
+    rm -f "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
   done
 
   if [[ ! -s "$seen_meta_file" ]]; then
@@ -305,50 +404,78 @@ cmd_extract_file() {
   local save_tar="$1"
   local image_path="$2"
   local out_path="$3"
-  local wh layer_path raw name i found_wh found_raw
-  local tmp_layer
+  local layer_path raw name base
+  local i found_raw tmp_layer tmp_root
+  local tmp_state deleted_file opaque_file layer_list layer_deleted_file layer_opaque_file
 
   image_path="$(norm_image_path "$image_path")"
-  wh="$(whiteout_name "$image_path")"
+
+  tmp_state="$(mktemp -d)"
+  deleted_file="$tmp_state/deleted"
+  opaque_file="$tmp_state/opaque"
+  touch "$deleted_file" "$opaque_file"
 
   read_layers "$save_tar"
 
   for ((i = ${#LAYERS[@]} - 1; i >= 0; i--)); do
+    if deleted_path_matches "$image_path" "$deleted_file" || is_under_opaque "$image_path" "$opaque_file"; then
+      rm -rf "$tmp_state"
+      die "Deleted by whiteout in a higher layer"
+    fi
+
     layer_path="${LAYERS[i]}"
     tmp_layer="$(mktemp)"
-    tar -xOf "$save_tar" "$layer_path" >"$tmp_layer"
+    layer_list="$(mktemp)"
+    layer_deleted_file="$tmp_state/layer_deleted_$i"
+    layer_opaque_file="$tmp_state/layer_opaque_$i"
+    touch "$layer_deleted_file" "$layer_opaque_file"
 
-    found_wh=0
+    tar -xOf "$save_tar" "$layer_path" >"$tmp_layer"
+    tar -tf "$tmp_layer" >"$layer_list"
+
+    collect_layer_whiteouts "$layer_list" "" "" "$layer_deleted_file" "$layer_opaque_file"
+
     found_raw=""
     while IFS= read -r raw; do
       name="$(sanitize_member_name "$raw")"
       [[ -z "$name" || "$name" == "." ]] && continue
-      if [[ "$name" == "$wh" ]]; then
-        found_wh=1
-      fi
+      base="${name##*/}"
+      [[ "$base" == .wh.* ]] && continue
       if [[ "$name" == "$image_path" && -z "$found_raw" ]]; then
         found_raw="$raw"
       fi
-    done < <(tar -tf "$tmp_layer")
-
-    if ((found_wh)); then
-      rm -f "$tmp_layer"
-      die "Deleted by whiteout in layer $layer_path"
-    fi
+    done <"$layer_list"
 
     if [[ -n "$found_raw" ]]; then
-      extract_member_to_path "$tmp_layer" "$found_raw" "$out_path" || {
-        rm -f "$tmp_layer"
+      tmp_root="$(mktemp -d)"
+      extract_layer_to_dir "$tmp_layer" "$tmp_root" || {
+        rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+        rm -rf "$tmp_root" "$tmp_state"
+        die "Failed to unpack layer $layer_path"
+      }
+      copy_extracted_path "$tmp_root" "$found_raw" "$out_path" || {
+        rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+        rm -rf "$tmp_root" "$tmp_state"
         die "Failed to extract $image_path from layer $layer_path"
       }
-      rm -f "$tmp_layer"
+      rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+      rm -rf "$tmp_root" "$tmp_state"
       log_export_tree "$out_path"
       return 0
     fi
 
-    rm -f "$tmp_layer"
+    merge_set_file "$deleted_file" "$layer_deleted_file"
+    merge_set_file "$opaque_file" "$layer_opaque_file"
+    if deleted_path_matches "$image_path" "$deleted_file" || is_under_opaque "$image_path" "$opaque_file"; then
+      rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+      rm -rf "$tmp_state"
+      die "Deleted by whiteout in layer $layer_path"
+    fi
+
+    rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
   done
 
+  rm -rf "$tmp_state"
   die "Not found in any layer: $image_path"
 }
 
@@ -356,9 +483,10 @@ cmd_extract_dir() {
   local save_tar="$1"
   local image_dir="$2"
   local out_dir="$3"
-  local prefix opq layer_path tmp_layer raw name base real parent deleted_target target_dir
+  local prefix opq layer_path tmp_layer raw name base
   local rel dest i
-  local tmp_state deleted_file opaque_file
+  local tmp_state deleted_file opaque_file seen_file
+  local layer_list layer_deleted_file layer_opaque_file tmp_root
 
   image_dir="$(norm_image_path "$image_dir")"
   image_dir="${image_dir%/}"
@@ -374,14 +502,29 @@ cmd_extract_dir() {
   tmp_state="$(mktemp -d)"
   deleted_file="$tmp_state/deleted"
   opaque_file="$tmp_state/opaque"
-  touch "$deleted_file" "$opaque_file"
+  seen_file="$tmp_state/seen"
+  touch "$deleted_file" "$opaque_file" "$seen_file"
 
   read_layers "$save_tar"
 
   for ((i = ${#LAYERS[@]} - 1; i >= 0; i--)); do
     layer_path="${LAYERS[i]}"
     tmp_layer="$(mktemp)"
+    layer_list="$(mktemp)"
+    layer_deleted_file="$tmp_state/layer_deleted_$i"
+    layer_opaque_file="$tmp_state/layer_opaque_$i"
+    touch "$layer_deleted_file" "$layer_opaque_file"
+
     tar -xOf "$save_tar" "$layer_path" >"$tmp_layer"
+    tar -tf "$tmp_layer" >"$layer_list"
+    collect_layer_whiteouts "$layer_list" "$prefix" "$image_dir" "$layer_deleted_file" "$layer_opaque_file"
+
+    tmp_root="$(mktemp -d)"
+    extract_layer_to_dir "$tmp_layer" "$tmp_root" || {
+      rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+      rm -rf "$tmp_root" "$tmp_state"
+      die "Failed to unpack layer $layer_path"
+    }
 
     while IFS= read -r raw; do
       name="$(sanitize_member_name "$raw")"
@@ -392,41 +535,23 @@ cmd_extract_dir() {
       fi
 
       if [[ "$name" == "$opq" ]]; then
-        set_add "$opaque_file" "$image_dir"
         continue
       fi
 
       base="${name##*/}"
       if [[ "$base" == .wh.* ]]; then
-        real="${base#.wh.}"
-        if [[ "$name" == */* ]]; then
-          parent="${name%/*}"
-        else
-          parent=""
-        fi
-
-        if [[ "$real" == ".wh..opq" || "$base" == ".wh..wh..opq" ]]; then
-          target_dir="$parent"
-          if [[ "$target_dir" == "$image_dir" || "$target_dir" == "$prefix"* ]]; then
-            set_add "$opaque_file" "$target_dir"
-          fi
-          continue
-        fi
-
-        if [[ -n "$parent" ]]; then
-          deleted_target="$parent/$real"
-        else
-          deleted_target="$real"
-        fi
-        set_add "$deleted_file" "$deleted_target"
         continue
       fi
 
-      if set_has "$deleted_file" "$name"; then
+      if deleted_path_matches "$name" "$deleted_file"; then
         continue
       fi
 
       if is_under_opaque "$name" "$opaque_file"; then
+        continue
+      fi
+
+      if set_has "$seen_file" "$name"; then
         continue
       fi
 
@@ -446,13 +571,18 @@ cmd_extract_dir() {
         dest="$out_dir"
       fi
 
-      extract_member_to_path "$tmp_layer" "$raw" "$dest" || {
-        rm -f "$tmp_layer"
+      copy_extracted_path "$tmp_root" "$raw" "$dest" || {
+        rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+        rm -rf "$tmp_root" "$tmp_state"
         die "Failed to extract member $name from layer $layer_path"
       }
-    done < <(tar -tf "$tmp_layer")
+      mark_seen_path_and_parents "$seen_file" "$name" "$image_dir"
+    done <"$layer_list"
 
-    rm -f "$tmp_layer"
+    merge_set_file "$deleted_file" "$layer_deleted_file"
+    merge_set_file "$opaque_file" "$layer_opaque_file"
+    rm -f "$tmp_layer" "$layer_list" "$layer_deleted_file" "$layer_opaque_file"
+    rm -rf "$tmp_root"
   done
 
   rm -rf "$tmp_state"
